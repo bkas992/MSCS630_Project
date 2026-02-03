@@ -20,8 +20,16 @@
 #include <map>
 #include <algorithm>
 
+// Deliverable 2 extra headers 
+#include <deque>
+#include <chrono>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+
 using std::string;
 
+//----------------Deliverable 1: Shell + Process Mgmt-------------------
 struct Job {
     int jobId = 0;
     pid_t pgid = -1;          // process group id
@@ -41,10 +49,6 @@ static void print_error(const string& msg) {
     std::cerr << "Error: " << msg;
     if (errno != 0) std::cerr << " (" << std::strerror(errno) << ")";
     std::cerr << "\n";
-}
-
-static void ignore_errno() {
-    errno = 0;
 }
 
 static string trim(const string& s) {
@@ -86,15 +90,12 @@ static void update_jobs_nonblocking() {
     while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0) {
         pid_t pgid = getpgid(pid);
 
-        for (auto& kv : g_jobs) {
-            Job& j = kv.second;
+        for (auto it = g_jobs.begin(); it != g_jobs.end(); ++it) {
+            Job& j = it->second;
             if (j.pgid == pgid) {
                 if (WIFEXITED(status) || WIFSIGNALED(status)) {
-                    // Job finished
-                    j.running = false;
-                    // Remove after printing a short message
                     std::cout << "[" << j.jobId << "] done  " << j.cmdline << "\n";
-                    g_jobs.erase(kv.first);
+                    g_jobs.erase(it);
                 } else if (WIFSTOPPED(status)) {
                     j.running = false;
                     std::cout << "[" << j.jobId << "] stopped  " << j.cmdline << "\n";
@@ -121,7 +122,7 @@ static void on_sigtstp(int) {
     }
 }
 
-// SIGCHLD handler (keep it minimal, do not print here)
+// SIGCHLD handler (keep it minimal)
 static volatile sig_atomic_t g_sigchld_flag = 0;
 static void on_sigchld(int) {
     g_sigchld_flag = 1;
@@ -153,9 +154,7 @@ static void init_shell_job_control() {
 
     // Put shell in its own process group
     g_shellPgid = getpid();
-    if (setpgid(g_shellPgid, g_shellPgid) < 0) {
-        // Some systems already have pgid set; ignore if harmless
-    }
+    setpgid(g_shellPgid, g_shellPgid);
     tcsetpgrp(g_shellTerminal, g_shellPgid);
 
     // Save terminal modes
@@ -237,8 +236,7 @@ static void builtin_cat(const std::vector<string>& args) {
     char buf[4096];
     ssize_t r;
     while ((r = read(fd, buf, sizeof(buf))) > 0) {
-        ssize_t w = write(STDOUT_FILENO, buf, (size_t)r);
-        (void)w;
+        write(STDOUT_FILENO, buf, (size_t)r);
     }
     close(fd);
 }
@@ -287,7 +285,6 @@ static void builtin_touch(const std::vector<string>& args) {
     }
     close(fd);
 
-    // Update timestamps to current time
     if (utime(path, nullptr) != 0) {
         print_error("touch failed to update timestamp");
     }
@@ -335,7 +332,6 @@ static void wait_for_foreground(pid_t pgid, const string& cmdline) {
 
     int status = 0;
     pid_t pid;
-    // Wait until the process group stops or exits
     do {
         pid = waitpid(-pgid, &status, WUNTRACED);
     } while (pid > 0 && !WIFEXITED(status) && !WIFSIGNALED(status) && !WIFSTOPPED(status));
@@ -346,7 +342,6 @@ static void wait_for_foreground(pid_t pgid, const string& cmdline) {
     if (pid < 0) return;
 
     if (WIFSTOPPED(status)) {
-        // Put it into jobs list as stopped
         Job j;
         j.jobId = g_nextJobId++;
         j.pgid = pgid;
@@ -369,7 +364,6 @@ static void builtin_fg(const std::vector<string>& args) {
         return;
     }
 
-    // Continue it if stopped
     if (!j->running) {
         if (kill(-j->pgid, SIGCONT) != 0) {
             print_error("fg failed to continue job");
@@ -381,9 +375,7 @@ static void builtin_fg(const std::vector<string>& args) {
     string cmdline = j->cmdline;
     pid_t pgid = j->pgid;
 
-    // Remove from jobs list while in foreground
     g_jobs.erase(jobId);
-
     wait_for_foreground(pgid, cmdline);
 }
 
@@ -406,10 +398,409 @@ static void builtin_bg(const std::vector<string>& args) {
     std::cout << "[" << j->jobId << "] running  " << j->cmdline << "\n";
 }
 
+// -------------------- Deliverable 2: Scheduling Simulation --------------------------
+
+enum class SimState { Ready, Running, Finished };
+
+struct SimProcess {
+    int pid = 0;
+    string name;
+    int priority = 10;            // lower number = higher priority
+    long burstMs = 0;
+    long remainingMs = 0;
+
+    SimState state = SimState::Ready;
+
+    std::chrono::steady_clock::time_point arrival;
+    std::chrono::steady_clock::time_point firstRun;
+    std::chrono::steady_clock::time_point finish;
+    bool hasStarted = false;
+};
+
+static long ms_between(const std::chrono::steady_clock::time_point& a,
+                       const std::chrono::steady_clock::time_point& b) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+}
+
+class SchedulerSim {
+public:
+    void add(const string& name, long burstMs, int priority) {
+        if (burstMs <= 0) burstMs = 1;
+        if (priority < 0) priority = 0;
+
+        SimProcess p;
+        p.pid = nextPid_++;
+        p.name = name;
+        p.priority = priority;
+        p.burstMs = burstMs;
+        p.remainingMs = burstMs;
+        p.arrival = std::chrono::steady_clock::now();
+        p.state = SimState::Ready;
+
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            procs_[p.pid] = p;
+            rrQueue_.push_back(p.pid);
+            push_prio_locked(p.pid);
+
+            // Preempt request if priority scheduler is active
+            if (prioRunning_ && currentPid_ != -1) {
+                int curPrio = procs_[currentPid_].priority;
+                if (priority < curPrio) preemptRequested_ = true;
+            }
+        }
+        cv_.notify_all();
+
+        std::cout << "simadd pid=" << p.pid
+                  << " name=" << p.name
+                  << " burstMs=" << p.burstMs
+                  << " priority=" << p.priority << "\n";
+    }
+
+    void list() {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (procs_.empty()) { std::cout << "No simulated processes\n"; return; }
+        std::cout << "Simulated processes\n";
+        for (const auto& kv : procs_) {
+            const SimProcess& p = kv.second;
+            std::cout << "pid=" << p.pid
+                      << " name=" << p.name
+                      << " prio=" << p.priority
+                      << " remainingMs=" << p.remainingMs
+                      << " state=" << state_str(p.state) << "\n";
+        }
+    }
+
+    void clear() {
+        stop_prio();
+        std::lock_guard<std::mutex> lk(mu_);
+        procs_.clear();
+        rrQueue_.clear();
+        heap_.clear();
+        currentPid_ = -1;
+        preemptRequested_ = false;
+        std::cout << "simclear done\n";
+    }
+
+    void rr_run(long quantumMs) {
+        if (quantumMs <= 0) quantumMs = 50;
+
+        std::deque<int> q;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            q = rrQueue_;
+        }
+        if (q.empty()) { std::cout << "rr: no simulated processes\n"; return; }
+
+        std::cout << "rr start quantumMs=" << quantumMs << "\n";
+
+        while (!q.empty()) {
+            int pid = q.front();
+            q.pop_front();
+
+            SimProcess* pptr = nullptr;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                auto it = procs_.find(pid);
+                if (it == procs_.end()) continue;
+                if (it->second.state == SimState::Finished) continue;
+
+                it->second.state = SimState::Running;
+                if (!it->second.hasStarted) {
+                    it->second.hasStarted = true;
+                    it->second.firstRun = std::chrono::steady_clock::now();
+                }
+                pptr = &it->second;
+            }
+            if (!pptr) continue;
+
+            long runFor = std::min(quantumMs, pptr->remainingMs);
+            std::cout << "rr running pid=" << pid
+                      << " name=" << pptr->name
+                      << " runMs=" << runFor
+                      << " remainingBefore=" << pptr->remainingMs << "\n";
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(runFor));
+
+            bool finished = false;
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                SimProcess& p = procs_[pid];
+                p.remainingMs -= runFor;
+                if (p.remainingMs <= 0) {
+                    p.remainingMs = 0;
+                    p.state = SimState::Finished;
+                    p.finish = std::chrono::steady_clock::now();
+                    finished = true;
+                } else {
+                    p.state = SimState::Ready;
+                }
+            }
+
+            if (finished) {
+                std::cout << "rr finished pid=" << pid << " name=" << pptr->name << "\n";
+            } else {
+                q.push_back(pid);
+            }
+        }
+
+        std::cout << "rr done\n";
+        stats("Round Robin");
+    }
+
+    void prio_start(long tickMs) {
+        if (tickMs <= 0) tickMs = 50;
+
+        std::lock_guard<std::mutex> lk(mu_);
+        if (prioRunning_) { std::cout << "prio already running\n"; return; }
+        prioRunning_ = true;
+        stopRequested_ = false;
+        tickMs_ = tickMs;
+        prioThread_ = std::thread([this]() { this->prio_loop(); });
+        std::cout << "prio_start tickMs=" << tickMs_ << "\n";
+    }
+
+    void stop_prio() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (!prioRunning_) return;
+            stopRequested_ = true;
+        }
+        cv_.notify_all();
+        if (prioThread_.joinable()) prioThread_.join();
+
+        std::lock_guard<std::mutex> lk(mu_);
+        prioRunning_ = false;
+        currentPid_ = -1;
+        preemptRequested_ = false;
+        std::cout << "prio_stop done\n";
+    }
+
+    void prio_status() {
+        std::lock_guard<std::mutex> lk(mu_);
+        std::cout << "prio running=" << (prioRunning_ ? "yes" : "no");
+        if (prioRunning_) std::cout << " currentPid=" << currentPid_;
+        std::cout << "\n";
+    }
+
+    void stats(const string& title) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (procs_.empty()) { std::cout << "No metrics available\n"; return; }
+
+        std::cout << "Metrics: " << title << "\n";
+        std::cout << "pid  name  prio  burstMs  responseMs  turnaroundMs  waitingMs  state\n";
+
+        long sumResp = 0, sumTurn = 0, sumWait = 0;
+        int countFinished = 0;
+
+        for (const auto& kv : procs_) {
+            const SimProcess& p = kv.second;
+
+            long responseMs = 0;
+            if (p.hasStarted) responseMs = ms_between(p.arrival, p.firstRun);
+
+            long turnaroundMs = 0;
+            long waitingMs = 0;
+
+            if (p.state == SimState::Finished) {
+                turnaroundMs = ms_between(p.arrival, p.finish);
+                waitingMs = turnaroundMs - p.burstMs;
+                if (waitingMs < 0) waitingMs = 0;
+                sumResp += responseMs;
+                sumTurn += turnaroundMs;
+                sumWait += waitingMs;
+                countFinished++;
+            }
+
+            std::cout << p.pid << "  "
+                      << p.name << "  "
+                      << p.priority << "  "
+                      << p.burstMs << "  "
+                      << responseMs << "  "
+                      << turnaroundMs << "  "
+                      << waitingMs << "  "
+                      << state_str(p.state) << "\n";
+        }
+
+        if (countFinished > 0) {
+            std::cout << "Averages for finished processes\n";
+            std::cout << "avgResponseMs=" << (sumResp / countFinished)
+                      << " avgTurnaroundMs=" << (sumTurn / countFinished)
+                      << " avgWaitingMs=" << (sumWait / countFinished) << "\n";
+        } else {
+            std::cout << "No finished processes yet for averages\n";
+        }
+    }
+
+private:
+    static const char* state_str(SimState s) {
+        switch (s) {
+            case SimState::Ready: return "ready";
+            case SimState::Running: return "running";
+            case SimState::Finished: return "finished";
+        }
+        return "unknown";
+    }
+
+    struct HeapItem {
+        int priority;
+        long long arrivalNs;
+        int pid;
+    };
+
+    static bool heap_comp(const HeapItem& a, const HeapItem& b) {
+        if (a.priority != b.priority) return a.priority > b.priority;
+        return a.arrivalNs > b.arrivalNs;
+    }
+
+    void push_prio_locked(int pid) {
+        const SimProcess& p = procs_[pid];
+        long long arrivalNs = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            p.arrival.time_since_epoch()).count();
+        heap_.push_back({p.priority, arrivalNs, pid});
+        std::push_heap(heap_.begin(), heap_.end(), heap_comp);
+    }
+
+    int pop_prio_locked() {
+        if (heap_.empty()) return -1;
+        std::pop_heap(heap_.begin(), heap_.end(), heap_comp);
+        int pid = heap_.back().pid;
+        heap_.pop_back();
+        return pid;
+    }
+
+    void rebuild_heap_locked() {
+        heap_.clear();
+        for (const auto& kv : procs_) {
+            const SimProcess& p = kv.second;
+            if (p.state != SimState::Finished && p.remainingMs > 0) {
+                push_prio_locked(p.pid);
+            }
+        }
+    }
+
+    bool has_ready_locked() const {
+        for (const auto& kv : procs_) {
+            const SimProcess& p = kv.second;
+            if (p.state != SimState::Finished && p.remainingMs > 0) return true;
+        }
+        return false;
+    }
+
+    void prio_loop() {
+        while (true) {
+            int pidToRun = -1;
+
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&]() { return stopRequested_ || has_ready_locked(); });
+                if (stopRequested_) break;
+
+                rebuild_heap_locked();
+
+                if (currentPid_ == -1) {
+                    pidToRun = pop_prio_locked();
+                    currentPid_ = pidToRun;
+                    if (pidToRun != -1) {
+                        SimProcess& p = procs_[pidToRun];
+                        p.state = SimState::Running;
+                        if (!p.hasStarted) {
+                            p.hasStarted = true;
+                            p.firstRun = std::chrono::steady_clock::now();
+                        }
+                        std::cout << "prio running pid=" << p.pid
+                                  << " name=" << p.name
+                                  << " prio=" << p.priority
+                                  << " remainingMs=" << p.remainingMs << "\n";
+                    }
+                } else {
+                    pidToRun = currentPid_;
+                }
+            }
+
+            if (pidToRun == -1) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(tickMs_));
+
+            bool finished = false;
+            bool preempt = false;
+
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (stopRequested_) break;
+
+                SimProcess& p = procs_[pidToRun];
+                if (p.remainingMs > 0) p.remainingMs -= tickMs_;
+                if (p.remainingMs <= 0) {
+                    p.remainingMs = 0;
+                    p.state = SimState::Finished;
+                    p.finish = std::chrono::steady_clock::now();
+                    finished = true;
+                    std::cout << "prio finished pid=" << p.pid << " name=" << p.name << "\n";
+                }
+
+                if (!finished && preemptRequested_) {
+                    preemptRequested_ = false;
+                    preempt = true;
+                }
+
+                if (finished) {
+                    currentPid_ = -1;
+                } else if (preempt) {
+                    p.state = SimState::Ready;
+                    push_prio_locked(p.pid);
+                    currentPid_ = -1;
+                    std::cout << "prio preempt pid=" << p.pid << " name=" << p.name << "\n";
+                }
+            }
+
+            cv_.notify_all();
+        }
+    }
+
+    std::mutex mu_;
+    std::condition_variable cv_;
+
+    std::map<int, SimProcess> procs_;
+    std::deque<int> rrQueue_;
+
+    std::vector<HeapItem> heap_;
+
+    int nextPid_ = 1;
+
+    std::thread prioThread_;
+    bool prioRunning_ = false;
+    bool stopRequested_ = false;
+    int currentPid_ = -1;
+    bool preemptRequested_ = false;
+    long tickMs_ = 50;
+};
+
+static SchedulerSim g_sched;
+
+static void sched_help() {
+    std::cout << "Deliverable 2 scheduling commands\n";
+    std::cout << "simadd <name> <burstMs> <priority>\n";
+    std::cout << "simps\n";
+    std::cout << "simclear\n";
+    std::cout << "rr <quantumMs>\n";
+    std::cout << "prio_start <tickMs>\n";
+    std::cout << "prio_stop\n";
+    std::cout << "prio_status\n";
+    std::cout << "simstats\n";
+    std::cout << "Note: lower priority number means higher priority\n";
+}
+
 static bool is_builtin(const string& cmd) {
     static const std::vector<string> builtins = {
-        "cd","pwd","exit","echo","clear","ls","cat","mkdir","rmdir","rm","touch","kill",
-        "jobs","fg","bg"
+        // Deliverable 1
+        "cd", "pwd", "exit", "echo", "clear", "ls", "cat", "mkdir", "rmdir", "rm", "touch", "kill",
+        "jobs", "fg", "bg",
+        // Deliverable 2
+        "help2", "simadd", "simps", "simclear", "rr", "prio_start", "prio_stop", "prio_status", "simstats"
     };
     return std::find(builtins.begin(), builtins.end(), cmd) != builtins.end();
 }
@@ -418,6 +809,7 @@ static void run_builtin(const std::vector<string>& args) {
     if (args.empty()) return;
     const string& cmd = args[0];
 
+    // Deliverable 1
     if (cmd == "pwd") builtin_pwd();
     else if (cmd == "cd") builtin_cd(args);
     else if (cmd == "echo") builtin_echo(args);
@@ -432,6 +824,33 @@ static void run_builtin(const std::vector<string>& args) {
     else if (cmd == "jobs") builtin_jobs();
     else if (cmd == "fg") builtin_fg(args);
     else if (cmd == "bg") builtin_bg(args);
+
+    // Deliverable 2
+    else if (cmd == "help2") sched_help();
+    else if (cmd == "simadd") {
+        if (args.size() < 4) { print_error("simadd requires: simadd <name> <burstMs> <priority>"); return; }
+        long burst = std::stol(args[2]);
+        int prio = std::stoi(args[3]);
+        g_sched.add(args[1], burst, prio);
+    } else if (cmd == "simps") {
+        g_sched.list();
+    } else if (cmd == "simclear") {
+        g_sched.clear();
+    } else if (cmd == "rr") {
+        if (args.size() < 2) { print_error("rr requires quantumMs"); return; }
+        long q = std::stol(args[1]);
+        g_sched.rr_run(q);
+    } else if (cmd == "prio_start") {
+        long tick = 50;
+        if (args.size() >= 2) tick = std::stol(args[1]);
+        g_sched.prio_start(tick);
+    } else if (cmd == "prio_stop") {
+        g_sched.stop_prio();
+    } else if (cmd == "prio_status") {
+        g_sched.prio_status();
+    } else if (cmd == "simstats") {
+        g_sched.stats("Current Simulation");
+    }
 }
 
 static void exec_external(std::vector<string> args, bool background, const string& cmdline) {
@@ -450,27 +869,22 @@ static void exec_external(std::vector<string> args, bool background, const strin
     }
 
     if (pid == 0) {
-        // Child: new process group
         setpgid(0, 0);
 
-        // If foreground, take terminal control
         if (!background) {
             tcsetpgrp(STDIN_FILENO, getpid());
         }
 
-        // Restore default signals in child
         signal(SIGINT, SIG_DFL);
         signal(SIGTSTP, SIG_DFL);
         signal(SIGCHLD, SIG_DFL);
 
         execvp(argv[0], argv.data());
 
-        // If execvp returns, it failed
         std::cerr << "Error: command not found: " << args[0] << "\n";
         _exit(127);
     }
 
-    // Parent: set child pgid
     setpgid(pid, pid);
 
     if (background) {
@@ -492,14 +906,12 @@ int main() {
     init_shell_job_control();
 
     while (true) {
-        // If SIGCHLD happened, update jobs in the main loop safely
         if (g_sigchld_flag) {
             g_sigchld_flag = 0;
-            ignore_errno();
+            errno = 0;
             update_jobs_nonblocking();
         }
 
-        // Prompt
         std::cout << "aos-shell$ ";
         std::cout.flush();
 
@@ -512,7 +924,7 @@ int main() {
         line = trim(line);
         if (line.empty()) continue;
 
-        // Check background marker "&" at end
+        // Background marker
         bool background = false;
         if (!line.empty() && line.back() == '&') {
             background = true;
@@ -524,15 +936,12 @@ int main() {
         if (args.empty()) continue;
 
         if (args[0] == "exit") {
-            // Optional: terminate jobs (simple behavior)
-            for (const auto& kv : g_jobs) {
-                kill(-kv.second.pgid, SIGTERM);
-            }
+            g_sched.stop_prio();
+            for (const auto& kv : g_jobs) kill(-kv.second.pgid, SIGTERM);
             break;
         }
 
         if (is_builtin(args[0])) {
-            // Builtins run in shell process (so cd affects current shell)
             run_builtin(args);
             continue;
         }
