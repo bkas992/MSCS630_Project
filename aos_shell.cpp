@@ -27,6 +27,12 @@
 #include <mutex>
 #include <condition_variable>
 
+// Deliverable 3 extra headers
+#include <unordered_map>
+#include <unordered_set>
+#include <list>
+#include <atomic>
+
 using std::string;
 
 //----------------Deliverable 1: Shell + Process Mgmt-------------------
@@ -781,6 +787,191 @@ private:
 
 static SchedulerSim g_sched;
 
+// -------------------- Deliverable 3: Memory Management --------------------
+// Paging with FIFO and LRU replacement
+
+struct PageKey {
+    int pid;
+    int page;
+
+    bool operator==(const PageKey& other) const {
+        return pid == other.pid && page == other.page;
+    }
+
+    bool operator!=(const PageKey& other) const {
+        return !(*this == other);
+    }
+};
+
+struct PageKeyHash {
+    std::size_t operator()(const PageKey& k) const {
+        return std::hash<int>()(k.pid) ^ std::hash<int>()(k.page);
+    }
+};
+
+class MemoryManager {
+public:
+    MemoryManager(int frames = 4) : maxFrames(frames) {}
+
+    void setAlgo(const string& a) {
+        algo = a;
+        frames.clear();
+        pages.clear();
+        lru.clear();
+        accesses = 0;
+        faults = 0;
+        std::cout << "memory algorithm set to " << algo << "\n";
+    }
+
+
+    void access(int pid, int page) {
+        PageKey key{pid, page};
+        accesses++;
+
+        if (pages.count(key)) {
+            if (algo == "LRU") {
+                for (auto it = lru.begin(); it != lru.end(); ++it) {
+                    if (it->pid == key.pid && it->page == key.page) {
+                        lru.erase(it);
+                        break;
+                    }
+                }
+                lru.push_back(key);
+            }
+
+            std::cout << "page hit pid=" << pid << " page=" << page << "\n";
+            return;
+        }
+
+        faults++;
+        std::cout << "page fault pid=" << pid << " page=" << page << "\n";
+
+        if ((int)frames.size() >= maxFrames) {
+            replace();
+        }
+
+        frames.push_back(key);
+        pages.insert(key);
+        if (algo == "LRU") lru.push_back(key);
+    }
+
+    void stats() const {
+        std::cout << "memory stats\n";
+        std::cout << "frames=" << maxFrames << "\n";
+        std::cout << "accesses=" << accesses << "\n";
+        std::cout << "faults=" << faults << "\n";
+    }
+
+private:
+    int maxFrames;
+    string algo = "FIFO";
+    int accesses = 0;
+    int faults = 0;
+
+    std::vector<PageKey> frames;
+    std::unordered_set<PageKey, PageKeyHash> pages;
+    std::list<PageKey> lru;
+
+    void replace() {
+        PageKey victim;
+
+        if (algo == "FIFO") {
+            victim = frames.front();
+            frames.erase(frames.begin());
+        } else { // LRU
+            victim = lru.front();
+            lru.pop_front();
+
+            for (auto it = frames.begin(); it != frames.end(); ++it) {
+                if (it->pid == victim.pid && it->page == victim.page) {
+                    frames.erase(it);
+                    break;
+                }
+            }
+        }
+
+        pages.erase(victim);
+
+        std::cout << "replaced pid=" << victim.pid
+                << " page=" << victim.page << "\n";
+    }
+};
+
+static MemoryManager g_mem;
+
+// -------------------- Deliverable 3: Process Synchronization --------------------
+// Producer Consumer using mutex and condition_variable
+
+class ProducerConsumer {
+public:
+    ProducerConsumer(int size = 5) : maxSize(size) {}
+
+    void start() {
+        if (running) {
+            std::cout << "producer consumer already running\n";
+            return;
+        }
+
+        running = true;
+
+        prod = std::thread(&ProducerConsumer::produce, this);
+        cons = std::thread(&ProducerConsumer::consume, this);
+
+        prod.detach();
+        cons.detach();
+
+        std::cout << "producer consumer started (non-blocking)\n";
+    }
+
+
+    void stop() {
+        running = false;
+        cv.notify_all();
+        std::cout << "producer consumer stop requested\n";
+    }
+
+
+private:
+    std::vector<int> buffer;
+    int maxSize;
+    std::atomic<bool> running{false};
+
+    std::mutex mu;
+    std::condition_variable cv;
+    std::thread prod, cons;
+
+    void produce() {
+        int item = 0;
+        while (running) {
+            std::unique_lock<std::mutex> lock(mu);
+            cv.wait_for(lock, std::chrono::milliseconds(200),
+                        [&] { return buffer.size() < (size_t)maxSize || !running; });
+
+            if (!running) break;
+
+            buffer.push_back(item++);
+            std::cout << "[PC] produced item\n";
+            cv.notify_all();
+        }
+    }
+
+    void consume() {
+        while (running) {
+            std::unique_lock<std::mutex> lock(mu);
+            cv.wait_for(lock, std::chrono::milliseconds(300),
+                        [&] { return !buffer.empty() || !running; });
+
+            if (!running) break;
+
+            buffer.pop_back();
+            std::cout << "[PC] consumed item\n";
+            cv.notify_all();
+        }
+    }
+};
+
+static ProducerConsumer g_pc;
+
 static void sched_help() {
     std::cout << "Deliverable 2 scheduling commands\n";
     std::cout << "simadd <name> <burstMs> <priority>\n";
@@ -800,7 +991,9 @@ static bool is_builtin(const string& cmd) {
         "cd", "pwd", "exit", "echo", "clear", "ls", "cat", "mkdir", "rmdir", "rm", "touch", "kill",
         "jobs", "fg", "bg",
         // Deliverable 2
-        "help2", "simadd", "simps", "simclear", "rr", "prio_start", "prio_stop", "prio_status", "simstats"
+        "help2", "simadd", "simps", "simclear", "rr", "prio_start", "prio_stop", "prio_status", "simstats",
+        // Deliverable 3
+        "memalgo", "memaccess", "memstats", "pc_start", "pc_stop"
     };
     return std::find(builtins.begin(), builtins.end(), cmd) != builtins.end();
 }
@@ -809,7 +1002,7 @@ static void run_builtin(const std::vector<string>& args) {
     if (args.empty()) return;
     const string& cmd = args[0];
 
-    // Deliverable 1
+    // ---------------- Deliverable 1 ----------------
     if (cmd == "pwd") builtin_pwd();
     else if (cmd == "cd") builtin_cd(args);
     else if (cmd == "echo") builtin_echo(args);
@@ -825,31 +1018,47 @@ static void run_builtin(const std::vector<string>& args) {
     else if (cmd == "fg") builtin_fg(args);
     else if (cmd == "bg") builtin_bg(args);
 
-    // Deliverable 2
+    // ---------------- Deliverable 2 ----------------
     else if (cmd == "help2") sched_help();
     else if (cmd == "simadd") {
-        if (args.size() < 4) { print_error("simadd requires: simadd <name> <burstMs> <priority>"); return; }
-        long burst = std::stol(args[2]);
-        int prio = std::stoi(args[3]);
-        g_sched.add(args[1], burst, prio);
-    } else if (cmd == "simps") {
-        g_sched.list();
-    } else if (cmd == "simclear") {
-        g_sched.clear();
-    } else if (cmd == "rr") {
-        if (args.size() < 2) { print_error("rr requires quantumMs"); return; }
-        long q = std::stol(args[1]);
-        g_sched.rr_run(q);
-    } else if (cmd == "prio_start") {
-        long tick = 50;
-        if (args.size() >= 2) tick = std::stol(args[1]);
+        if (args.size() < 4) {
+            print_error("simadd requires: simadd <name> <burstMs> <priority>");
+            return;
+        }
+        g_sched.add(args[1], std::stol(args[2]), std::stoi(args[3]));
+    }
+    else if (cmd == "simps") g_sched.list();
+    else if (cmd == "simclear") g_sched.clear();
+    else if (cmd == "rr") {
+        if (args.size() < 2) {
+            print_error("rr requires quantumMs");
+            return;
+        }
+        g_sched.rr_run(std::stol(args[1]));
+    }
+    else if (cmd == "prio_start") {
+        long tick = (args.size() >= 2) ? std::stol(args[1]) : 50;
         g_sched.prio_start(tick);
-    } else if (cmd == "prio_stop") {
-        g_sched.stop_prio();
-    } else if (cmd == "prio_status") {
-        g_sched.prio_status();
-    } else if (cmd == "simstats") {
-        g_sched.stats("Current Simulation");
+    }
+    else if (cmd == "prio_stop") g_sched.stop_prio();
+    else if (cmd == "prio_status") g_sched.prio_status();
+    else if (cmd == "simstats") g_sched.stats("Current Simulation");
+
+    // ---------------- Deliverable 3 ----------------
+    else if (cmd == "memalgo") {
+        g_mem.setAlgo(args[1]);
+    }
+    else if (cmd == "memaccess") {
+        g_mem.access(std::stoi(args[1]), std::stoi(args[2]));
+    }
+    else if (cmd == "memstats") {
+        g_mem.stats();
+    }
+    else if (cmd == "pc_start") {
+        g_pc.start();
+    }
+    else if (cmd == "pc_stop") {
+        g_pc.stop();
     }
 }
 
