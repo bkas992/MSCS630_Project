@@ -64,6 +64,11 @@ static string trim(const string& s) {
     return s.substr(a, b - a + 1);
 }
 
+// Deliverable 4 forward declarations (used by earlier built-ins)
+static void require_login_or_exit();
+static bool perm_check(const string& pathIn, int needBits, const char* opName);
+static void perm_create_owner(const string& pathIn);
+
 // Simple tokenizer (supports quotes "like this")
 static std::vector<string> tokenize(const string& line) {
     std::vector<string> out;
@@ -128,7 +133,7 @@ static void on_sigtstp(int) {
     }
 }
 
-// SIGCHLD handler (keep it minimal)
+// SIGCHLD handler
 static volatile sig_atomic_t g_sigchld_flag = 0;
 static void on_sigchld(int) {
     g_sigchld_flag = 1;
@@ -150,7 +155,6 @@ static void install_signal_handlers() {
     sa.sa_handler = on_sigchld;
     sigaction(SIGCHLD, &sa, nullptr);
 
-    // Shell ignores SIGTTOU so tcsetpgrp calls do not stop the shell
     signal(SIGTTOU, SIG_IGN);
     signal(SIGTTIN, SIG_IGN);
 }
@@ -234,7 +238,8 @@ static void builtin_cat(const std::vector<string>& args) {
         print_error("cat requires a filename");
         return;
     }
-    int fd = open(args[1].c_str(), O_RDONLY);
+        if (!perm_check(args[1], 4, "read")) return;
+int fd = open(args[1].c_str(), O_RDONLY);
     if (fd < 0) {
         print_error("cat failed to open file");
         return;
@@ -252,9 +257,11 @@ static void builtin_mkdir(const std::vector<string>& args) {
         print_error("mkdir requires a directory name");
         return;
     }
-    if (::mkdir(args[1].c_str(), 0755) != 0) {
+        if (!perm_check(args[1], 2, "write")) return;
+if (::mkdir(args[1].c_str(), 0755) != 0) {
         print_error("mkdir failed");
     }
+    else { perm_create_owner(args[1]); }
 }
 
 static void builtin_rmdir(const std::vector<string>& args) {
@@ -262,7 +269,8 @@ static void builtin_rmdir(const std::vector<string>& args) {
         print_error("rmdir requires a directory name");
         return;
     }
-    if (::rmdir(args[1].c_str()) != 0) {
+        if (!perm_check(args[1], 2, "write")) return;
+if (::rmdir(args[1].c_str()) != 0) {
         print_error("rmdir failed (directory must be empty)");
     }
 }
@@ -272,7 +280,8 @@ static void builtin_rm(const std::vector<string>& args) {
         print_error("rm requires a filename");
         return;
     }
-    if (::unlink(args[1].c_str()) != 0) {
+        if (!perm_check(args[1], 2, "write")) return;
+if (::unlink(args[1].c_str()) != 0) {
         print_error("rm failed");
     }
 }
@@ -284,12 +293,18 @@ static void builtin_touch(const std::vector<string>& args) {
     }
     const char* path = args[1].c_str();
 
-    int fd = open(path, O_CREAT | O_WRONLY, 0644);
+        bool existed = (access(path, F_OK) == 0);
+    if (existed) { if (!perm_check(args[1], 2, "write")) return; }
+int fd = open(path, O_CREAT | O_WRONLY, 0644);
     if (fd < 0) {
         print_error("touch failed to create/open file");
         return;
     }
     close(fd);
+
+    if (!existed) {
+        perm_create_owner(args[1]);
+    }
 
     if (utime(path, nullptr) != 0) {
         print_error("touch failed to update timestamp");
@@ -972,6 +987,386 @@ private:
 
 static ProducerConsumer g_pc;
 
+// -------- Deliverable 4: Integration, Piping, and Security ------------
+// ---------- User Authentication (simulated users and roles) ----------
+
+enum class UserRole { Admin, Standard };
+
+struct UserAccount {
+    string username;
+    string password;
+    UserRole role = UserRole::Standard;
+};
+
+static std::vector<UserAccount> g_users = {
+    {"admin", "admin123", UserRole::Admin},
+    {"user",  "user123",  UserRole::Standard}
+};
+
+static bool g_authenticated = false;
+static UserAccount g_currentUser{};
+
+static const char* role_str(UserRole r) {
+    return (r == UserRole::Admin) ? "admin" : "standard";
+}
+
+static bool auth_login_prompt() {
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        std::cout << "login: ";
+        std::cout.flush();
+        string u;
+        if (!std::getline(std::cin, u)) return false;
+        u = trim(u);
+
+        std::cout << "password: ";
+        std::cout.flush();
+        string p;
+        if (!std::getline(std::cin, p)) return false;
+
+        for (const auto& acc : g_users) {
+            if (acc.username == u && acc.password == p) {
+                g_authenticated = true;
+                g_currentUser = acc;
+                std::cout << "Welcome " << g_currentUser.username
+                          << " (" << role_str(g_currentUser.role) << ")\n";
+                return true;
+            }
+        }
+
+        std::cout << "Invalid credentials (" << attempt << "/3)\n";
+    }
+    return false;
+}
+
+static void require_login_or_exit() {
+    while (!g_authenticated) {
+        if (!auth_login_prompt()) {
+            std::cout << "Authentication failed. Exiting.\n";
+            std::exit(1);
+        }
+    }
+}
+
+// ---------- File Permissions (simulated owner, owner perms, other perms) ----------
+// Note: This is a simulation layer. It is separate from OS file permissions.
+
+struct SimPerm {
+    string owner;
+    int ownerPerm = 6;  // rw-
+    int otherPerm = 4;  // r--
+    bool isSystem = false;
+};
+
+static std::unordered_map<string, SimPerm> g_permTable;
+
+static int rwx_to_bits(const string& rwx) {
+    if (rwx.size() < 3) return 0;
+    int bits = 0;
+    if (rwx[0] == 'r') bits |= 4;
+    if (rwx[1] == 'w') bits |= 2;
+    if (rwx[2] == 'x') bits |= 1;
+    return bits;
+}
+
+static string bits_to_rwx(int bits) {
+    string s = "---";
+    if (bits & 4) s[0] = 'r';
+    if (bits & 2) s[1] = 'w';
+    if (bits & 1) s[2] = 'x';
+    return s;
+}
+
+static string abs_path_of(const string& pathIn) {
+    if (pathIn.empty()) return pathIn;
+    if (!pathIn.empty() && pathIn[0] == '/') return pathIn;
+
+    char cwd[4096];
+    if (!getcwd(cwd, sizeof(cwd))) return pathIn;
+    string out = string(cwd);
+    if (!out.empty() && out.back() != '/') out.push_back('/');
+    out += pathIn;
+    return out;
+}
+
+static void perm_register_if_missing(const string& pathIn) {
+    string p = abs_path_of(pathIn);
+    if (g_permTable.find(p) != g_permTable.end()) return;
+
+    SimPerm sp;
+    sp.owner = "admin";
+    sp.ownerPerm = 6;
+    sp.otherPerm = 4;
+
+    // Treat files in /etc, /bin, /usr, /System as "system"
+    if (p.rfind("/etc/", 0) == 0 || p.rfind("/bin/", 0) == 0 ||
+        p.rfind("/usr/", 0) == 0 || p.rfind("/System/", 0) == 0) {
+        sp.isSystem = true;
+    }
+
+    g_permTable[p] = sp;
+}
+
+static bool perm_is_owner(const SimPerm& sp) {
+    return g_authenticated && (g_currentUser.username == sp.owner);
+}
+
+static bool perm_has(int bits, int need) {
+    return (bits & need) == need;
+}
+
+static bool perm_check(const string& pathIn, int needBits, const char* opName) {
+    if (!g_authenticated) return false;
+
+    // Admin can do anything, but still simulate system warning output
+    if (g_currentUser.role == UserRole::Admin) return true;
+
+    perm_register_if_missing(pathIn);
+    string p = abs_path_of(pathIn);
+    const SimPerm& sp = g_permTable[p];
+
+    if (sp.isSystem && needBits & 2) {  // write on system file
+        std::cout << "permission denied: standard user cannot modify system file: " << p << "\n";
+        return false;
+    }
+
+    int allowed = perm_is_owner(sp) ? sp.ownerPerm : sp.otherPerm;
+    if (!perm_has(allowed, needBits)) {
+        std::cout << "permission denied (" << opName << "): " << p
+                  << " required=" << bits_to_rwx(needBits)
+                  << " allowed=" << bits_to_rwx(allowed) << "\n";
+        return false;
+    }
+    return true;
+}
+
+static void perm_create_owner(const string& pathIn) {
+    if (!g_authenticated) return;
+    string p = abs_path_of(pathIn);
+    SimPerm sp;
+    sp.owner = g_currentUser.username;
+    sp.ownerPerm = 6;
+    sp.otherPerm = 4;
+    g_permTable[p] = sp;
+}
+
+static void builtin_whoami() {
+    if (!g_authenticated) {
+        std::cout << "not logged in\n";
+        return;
+    }
+    std::cout << g_currentUser.username << " (" << role_str(g_currentUser.role) << ")\n";
+}
+
+static void builtin_logout() {
+    g_authenticated = false;
+    g_currentUser = UserAccount{};
+    std::cout << "logged out\n";
+    require_login_or_exit();
+}
+
+static void builtin_permset(const std::vector<string>& args) {
+    if (args.size() < 5) {
+        print_error("permset requires: permset <path> <owner> <ownerPerm(rwx)> <otherPerm(rwx)>");
+        return;
+    }
+    if (!g_authenticated || g_currentUser.role != UserRole::Admin) {
+        std::cout << "permission denied: permset requires admin\n";
+        return;
+    }
+
+    string p = abs_path_of(args[1]);
+    SimPerm sp;
+    sp.owner = args[2];
+    sp.ownerPerm = rwx_to_bits(args[3]);
+    sp.otherPerm = rwx_to_bits(args[4]);
+
+    if (p.rfind("/etc/", 0) == 0 || p.rfind("/bin/", 0) == 0 ||
+        p.rfind("/usr/", 0) == 0 || p.rfind("/System/", 0) == 0) {
+        sp.isSystem = true;
+    }
+
+    g_permTable[p] = sp;
+    std::cout << "permset " << p << " owner=" << sp.owner
+              << " ownerPerm=" << bits_to_rwx(sp.ownerPerm)
+              << " otherPerm=" << bits_to_rwx(sp.otherPerm) << "\n";
+}
+
+static void builtin_permls() {
+    if (!g_authenticated) {
+        std::cout << "not logged in\n";
+        return;
+    }
+    if (g_permTable.empty()) {
+        std::cout << "no simulated permissions tracked yet\n";
+        return;
+    }
+    std::cout << "simulated permissions\n";
+    for (const auto& kv : g_permTable) {
+        const auto& p = kv.first;
+        const auto& sp = kv.second;
+        std::cout << p
+                  << " owner=" << sp.owner
+                  << " ownerPerm=" << bits_to_rwx(sp.ownerPerm)
+                  << " otherPerm=" << bits_to_rwx(sp.otherPerm)
+                  << (sp.isSystem ? " [system]" : "")
+                  << "\n";
+    }
+}
+
+static void help4() {
+    std::cout << "Deliverable 4 commands\n";
+    std::cout << "whoami\n";
+    std::cout << "logout\n";
+    std::cout << "permset <path> <owner> <ownerPerm(rwx)> <otherPerm(rwx)>  (admin only)\n";
+    std::cout << "permls\n";
+    std::cout << "Piping examples\n";
+    std::cout << "ls | grep txt\n";
+    std::cout << "cat file.txt | grep error | sort\n";
+}
+
+// ---------- Piping (command1 | command2 | command3) ----------
+
+static std::vector<string> split_pipes(const string& line) {
+    std::vector<string> parts;
+    std::stringstream ss(line);
+    string seg;
+
+    // manual split to preserve segments with spaces
+    size_t start = 0;
+    while (start < line.size()) {
+        size_t pos = line.find('|', start);
+        if (pos == string::npos) pos = line.size();
+        string piece = trim(line.substr(start, pos - start));
+        if (!piece.empty()) parts.push_back(piece);
+        start = pos + 1;
+    }
+    return parts;
+}
+
+static void exec_pipeline(const string& cmdline, bool background) {
+    auto parts = split_pipes(cmdline);
+    if (parts.size() < 2) return;
+
+    std::vector<std::vector<string>> cmds;
+    for (const auto& p : parts) {
+        auto a = tokenize(p);
+        if (a.empty()) return;
+        cmds.push_back(a);
+    }
+
+    std::vector<pid_t> pids;
+    pids.reserve(cmds.size());
+
+    int prevRead = -1;
+    pid_t pgid = -1;
+
+    for (size_t i = 0; i < cmds.size(); i++) {
+        int fds[2] = {-1, -1};
+        bool last = (i + 1 == cmds.size());
+        if (!last) {
+            if (pipe(fds) != 0) {
+                print_error("pipe failed");
+                return;
+            }
+        }
+
+        // Build argv
+        std::vector<char*> argv;
+        argv.reserve(cmds[i].size() + 1);
+        for (auto& s : cmds[i]) argv.push_back(const_cast<char*>(s.c_str()));
+        argv.push_back(nullptr);
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            print_error("fork failed");
+            return;
+        }
+
+        if (pid == 0) {
+            // Child
+            if (pgid == -1) setpgid(0, 0);
+            else setpgid(0, pgid);
+
+            if (!background && i == 0) {
+                tcsetpgrp(STDIN_FILENO, getpid());
+            }
+
+            if (prevRead != -1) {
+                dup2(prevRead, STDIN_FILENO);
+            }
+            if (!last) {
+                dup2(fds[1], STDOUT_FILENO);
+            }
+
+            if (prevRead != -1) close(prevRead);
+            if (!last) {
+                close(fds[0]);
+                close(fds[1]);
+            }
+
+            signal(SIGINT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGCHLD, SIG_DFL);
+
+            execvp(argv[0], argv.data());
+            std::cerr << "Error: command not found: " << cmds[i][0] << "\n";
+            _exit(127);
+        }
+
+        // Parent
+        if (pgid == -1) pgid = pid;
+        setpgid(pid, pgid);
+        pids.push_back(pid);
+
+        if (prevRead != -1) close(prevRead);
+        if (!last) {
+            close(fds[1]);
+            prevRead = fds[0];
+        } else {
+            prevRead = -1;
+        }
+    }
+
+    if (background) {
+        Job j;
+        j.jobId = g_nextJobId++;
+        j.pgid = pgid;
+        j.cmdline = cmdline + " &";
+        j.running = true;
+        g_jobs[j.jobId] = j;
+
+        std::cout << "[" << j.jobId << "] started pgid=" << j.pgid << "  " << j.cmdline << "\n";
+    } else {
+        // Wait for entire process group to finish, or stop
+        g_fgPgid = pgid;
+        give_terminal_to(pgid);
+
+        int status = 0;
+        pid_t wpid;
+        bool stopped = false;
+
+        while ((wpid = waitpid(-pgid, &status, WUNTRACED)) > 0) {
+            if (WIFSTOPPED(status)) {
+                stopped = true;
+                break;
+            }
+        }
+
+        take_terminal_back();
+        g_fgPgid = -1;
+
+        if (stopped) {
+            Job j;
+            j.jobId = g_nextJobId++;
+            j.pgid = pgid;
+            j.cmdline = cmdline;
+            j.running = false;
+            g_jobs[j.jobId] = j;
+            std::cout << "[" << j.jobId << "] stopped  " << j.cmdline << "\n";
+        }
+    }
+}
+
 static void sched_help() {
     std::cout << "Deliverable 2 scheduling commands\n";
     std::cout << "simadd <name> <burstMs> <priority>\n";
@@ -993,7 +1388,9 @@ static bool is_builtin(const string& cmd) {
         // Deliverable 2
         "help2", "simadd", "simps", "simclear", "rr", "prio_start", "prio_stop", "prio_status", "simstats",
         // Deliverable 3
-        "memalgo", "memaccess", "memstats", "pc_start", "pc_stop"
+        "memalgo", "memaccess", "memstats", "pc_start", "pc_stop",
+        // Deliverable 4
+        "help4", "whoami", "logout", "permset", "permls"
     };
     return std::find(builtins.begin(), builtins.end(), cmd) != builtins.end();
 }
@@ -1060,12 +1457,39 @@ static void run_builtin(const std::vector<string>& args) {
     else if (cmd == "pc_stop") {
         g_pc.stop();
     }
+
+    // ---------------- Deliverable 4 ----------------
+    else if (cmd == "help4") {
+        help4();
+    }
+    else if (cmd == "whoami") {
+        builtin_whoami();
+    }
+    else if (cmd == "logout") {
+        builtin_logout();
+    }
+    else if (cmd == "permset") {
+        builtin_permset(args);
+    }
+    else if (cmd == "permls") {
+        builtin_permls();
+    }
+
 }
 
 static void exec_external(std::vector<string> args, bool background, const string& cmdline) {
     if (args.empty()) return;
 
-    // Build argv for execvp
+    
+    // Deliverable 4: piping support (cmd1 | cmd2 | ...)
+    if (cmdline.find('|') != string::npos) {
+        string cl = cmdline;
+        // remove trailing '&' if present
+        if (!cl.empty() && cl.back() == '&') { cl.pop_back(); cl = trim(cl); }
+        exec_pipeline(cl, background);
+        return;
+    }
+// Build argv for execvp
     std::vector<char*> argv;
     argv.reserve(args.size() + 1);
     for (auto& s : args) argv.push_back(const_cast<char*>(s.c_str()));
@@ -1114,6 +1538,10 @@ int main() {
     install_signal_handlers();
     init_shell_job_control();
 
+
+    // Deliverable 4: user authentication required before using the shell
+    require_login_or_exit();
+
     while (true) {
         if (g_sigchld_flag) {
             g_sigchld_flag = 0;
@@ -1139,6 +1567,16 @@ int main() {
             background = true;
             line.pop_back();
             line = trim(line);
+        }
+
+        // Deliverable 4: piping
+        if (line.find('|') != string::npos) {
+            if (background) {
+                print_error("background pipelines are not supported");
+            } else {
+                exec_pipeline(line, false);
+            }
+            continue;
         }
 
         auto args = tokenize(line);
